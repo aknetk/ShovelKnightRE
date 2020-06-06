@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 import sys
 import struct
 from collections import namedtuple
@@ -11,6 +8,9 @@ import io
 import zlib
 import math
 from PIL import Image
+from xml.etree.ElementTree import Element, SubElement, Comment, tostring
+from xml.dom import minidom
+from xml.etree import ElementTree
 
 import hashlib
 
@@ -29,6 +29,67 @@ def _exit(msg):
 # str: filename
 # ]
 
+def prettifyXML(elem):
+    rough_string = ElementTree.tostring(elem, "utf8")
+    reparsed = minidom.parseString(rough_string)
+    return reparsed.toprettyxml(indent="  ")
+
+
+"""
+    uint32_t wfLZ_GetMaxCompressedSize( const uint32_t inSize )
+    {
+        return
+            // header
+            sizeof( wfLZ_Header )
+            +
+            // size of uncompressible data
+            (inSize/WFLZ_MAX_SEQUENTIAL_LITERALS + 1) * (WFLZ_MAX_SEQUENTIAL_LITERALS+WFLZ_BLOCK_SIZE)
+            +
+            // terminating block
+            WFLZ_BLOCK_SIZE;
+    }
+
+    void CompressFake( uint8_t* dst, const uint8_t* src, uint32_t len )
+    {
+      // this assumes 'dst' is already allocated and has enough space, see wfLZ_GetMaxCompressedSize
+
+      // how many command blocks will this require? (rounded up)
+      uint32_t numCmdBlocks = (len+WFLZ_BLOCK_SIZE-1)/WFLZ_BLOCK_SIZE;
+
+      // include the end block
+      ++numCmdBlocks;
+
+      // write the header
+      wfLZ_Header* header = (wfLZ_Header*)dst;
+      header->sig[0] = 'W';
+      header->sig[1] = 'F';
+      header->sig[2] = 'L';
+      header->sig[3] = 'Z';
+      header->compressedSize = len + numCmdBlocks*WFLZ_BLOCK_SIZE;
+      header->uncompressedSize = len;
+      dst += sizeof(wfLZ_Header);
+
+      // output the data with interspersed command blocks
+      while( len )
+      {
+        wfLZ_Block* block = (wfLZ_Block*)dst;
+        block->dist = 0;
+        block->length = 0;
+        block->numLiterals = WFLZ_MAX_SEQUENTIAL_LITERALS;
+        dst += sizeof(wfLZ_Block);
+        uint32_t numCopy = len > WFLZ_MAX_SEQUENTIAL_LITERALS ? WFLZ_MAX_SEQUENTIAL_LITERALS : len ;
+        memcpy( dst, src, numCopy );
+        dst += numCopy;
+        len -= numCopy;
+      }
+
+      // output the end block
+      wfLZ_Block* block = (wfLZ_Block*)dst;
+      block->dist = 0;
+      block->length = 0;
+      block->numLiterals = 0;
+    }
+"""
 
 class WFLZ:
     def decomp_bytearr(self, bytearr):
@@ -81,6 +142,7 @@ class WFLZ:
                     outarray[outindex] = outarray[cpySrc + i]
                     outindex += 1
         return outarray
+    # Thanks Shane!
     def comp_file(self, file):
         return bytearray(0)
 
@@ -89,7 +151,14 @@ def ReadType(file, type):
 def ReadTypeBE(file, type):
     return struct.unpack(">" + type, file.read({ "B": 1, "H": 2, "I": 4 }[type]))[0]
 def ReadRSDKString(file):
-    return file.read(ReadType(file, "B")).decode("utf-8").split('\0', 1)[0]
+    return file.read(ReadType(file, "B")).decode("utf8").split('\0', 1)[0]
+def ReadString(file):
+    str = ""
+    bb = ReadType(file, "B")
+    while bb != 0:
+        str += "%c" % bb
+        bb = ReadType(file, "B")
+    return str
 def ReadCompressed(file, type):
     compressedSize = ReadType(file, "I") - 4
     decompressedSize = ReadTypeBE(file, "I")
@@ -120,6 +189,81 @@ def WriteCompressed(file, type, value):
     WriteType(file, "I", compressedSize + 4)
     WriteTypeBE(file, "I", decompressedSize)
     file.write(buff)
+
+def ROL4(n, d):
+    n &= 0xFFFFFFFF
+    return ((n << d) | (n >> (32 - d))) & 0xFFFFFFFF
+def ROR4(n, d):
+    n &= 0xFFFFFFFF
+    return ((n >> d) | (n << (32 - d)) & 0xFFFFFFFF) & 0xFFFFFFFF
+# The cleaner source: http://www.burtleburtle.net/bob/hash/doobs.html
+def YCG_Hash(string, length, initialHash):
+    stringBytes = string.encode("utf8")
+    stringBuff = io.BytesIO(stringBytes)
+
+    index = 0
+    hashA = (length + initialHash + 0xDEADBEEF) & 0xFFFFFFFF
+    hashB = (length + initialHash + 0xDEADBEEF) & 0xFFFFFFFF
+    hashC = (length + initialHash + 0xDEADBEEF) & 0xFFFFFFFF
+
+    while length > 12:
+        sHashA = hashA
+        sHashB = hashB
+        sHashC = hashC
+        for i in range(min(length, 4)):
+            sHashC += ReadType(stringBuff, "B") << ((i & 3) << 3)
+            sHashC &= 0xFFFFFFFF
+            length -= 1
+        for i in range(min(length, 4)):
+            sHashB += ReadType(stringBuff, "B") << ((i & 3) << 3)
+            sHashB &= 0xFFFFFFFF
+            length -= 1
+        for i in range(min(length, 4)):
+            sHashA += ReadType(stringBuff, "B") << ((i & 3) << 3)
+            sHashA &= 0xFFFFFFFF
+            length -= 1
+
+        a = (sHashC - sHashA + 0x100000000) ^ ROL4(sHashA, 4)
+        a1 = sHashB + sHashA
+        b = (sHashB - a + 0x100000000) ^ ROL4(a, 6)
+        b1 = a1 + a
+        c = (a1 - b + 0x100000000) ^ ROL4(b, 8)
+        c1 = b1 + b
+        d = (b1 - c + 0x100000000) ^ ROL4(c, 16)
+        d1 = c1 + c
+        e = (c1 - d + 0x100000000) ^ ROR4(d, 13)
+        hashC = d1 + d
+        hashA = (d1 - e + 0x100000000) ^ ROL4(e, 4)
+        hashB = hashC + e
+
+    if length <= 12:
+        for i in range(min(length, 4)):
+            hashC += ReadType(stringBuff, "B") << ((i & 3) << 3)
+            hashC &= 0xFFFFFFFF
+            length -= 1
+        for i in range(min(length, 4)):
+            hashB += ReadType(stringBuff, "B") << ((i & 3) << 3)
+            hashB &= 0xFFFFFFFF
+            length -= 1
+        for i in range(min(length, 4)):
+            hashA += ReadType(stringBuff, "B") << ((i & 3) << 3)
+            hashA &= 0xFFFFFFFF
+            length -= 1
+
+    # Finish
+    a = (hashB ^ hashA) - ROL4(hashB, 14) + 0x100000000
+    a &= 0xFFFFFFFF
+    b = (hashC ^ a) - ROL4(a, 11) + 0x100000000
+    b &= 0xFFFFFFFF
+    c = (b ^ hashB) - ROR4(b, 7) + 0x100000000
+    c &= 0xFFFFFFFF
+    d = (c ^ a) - ROL4(c, 16) + 0x100000000
+    d &= 0xFFFFFFFF
+    e = (((b ^ d) - ROL4(d, 4) + 0x100000000) ^ c) - ROL4((b ^ d) - ROL4(d, 4) + 0x100000000, 14) + 0x100000000
+    e &= 0xFFFFFFFF
+    f = ((e ^ d) - ROR4(e, 8)) + 0x100000000
+    f &= 0xFFFFFFFF
+    return f
 
 class RSDK_SceneEditorMetadata:
     def __init__(self, file = None):
@@ -570,6 +714,9 @@ class LTBClass:
         file = self.file
         # path_hash = unpack(file, 4)
 
+        # fpath = "levels/core/plainsOfPassage.ltb"
+        # print("File Hash: 0x%08X" % YCG_Hash(fpath, len(fpath), 123456789))
+
         self.ltb_start = ltb_start = 0x10
         file.seek(ltb_start)
 
@@ -700,20 +847,20 @@ class LVBClass:
         header = struct.unpack("IIQIIQIIQIIQIIQIIQIIQ", file.read(0x70))
 
         unk_Value_0x00 = header[0]
-        unk_Count_0x00 = header[1]
-        unk_Offset_0x00 = header[2]
-        unk_Value_0x10 = header[3]
+        objectPropertyCountListCount = header[1]
+        objectPropertyCountListOffset = header[2]
+        objectInfoCount = header[3]
         unk_Count_0x10 = header[4]
-        unk_Offset_0x10 = header[5]
+        objectInfoListOffset = header[5]
         unk_Value_0x20 = header[6]
-        unk_Count_0x20 = header[7]
-        unk_Offset_0x20 = header[8]
+        rectangleBatchCount = header[7]
+        rectangleBatchOffset = header[8]
         unk_Value_0x30 = header[9]
-        unk_Count_0x30 = header[10]
-        unk_Offset_0x30 = header[11]
+        rectListCount = header[10]
+        rectListOffset = header[11]
         unk_Value_0x40 = header[12]
-        unk_Count_0x40 = header[13]
-        unk_Offset_0x40 = header[14]
+        propertyValueSetListCount = header[13]
+        propertyValueSetListOffset = header[14]
         unk_Value_0x50 = header[15]
         unk_Count_0x50 = header[16]
         unk_Offset_0x50 = header[17]
@@ -724,116 +871,104 @@ class LVBClass:
         print("LayerObject Header:")
         print("-------------------")
         print("unk_Value_0x00: %d" % unk_Value_0x00)
-        print("unk_Count_0x00: %d" % unk_Count_0x00)
-        print("unk_Offset_0x00: 0x%X" % unk_Offset_0x00)
+        print("objectPropertyCountListCount: 0x%X" % objectPropertyCountListCount)
+        print("objectPropertyCountListOffset: 0x%X" % objectPropertyCountListOffset)
         print("")
-        print("unk_Value_0x10: %d" % unk_Value_0x10)
-        print("unk_Count_0x10: %d" % unk_Count_0x10)
-        print("unk_Offset_0x10: 0x%X" % unk_Offset_0x10)
+        print("objectInfoCount: 0x%X" % objectInfoCount)
+        print("unk_Count_0x10: 0x%X" % unk_Count_0x10)
+        print("objectInfoListOffset: 0x%X" % objectInfoListOffset)
         print("")
-        print("unk_Value_0x20: %d" % unk_Value_0x20)
-        print("unk_Count_0x20: %d" % unk_Count_0x20) # 0x1C
-        print("unk_Offset_0x20: 0x%X" % unk_Offset_0x20)
+        print("rectangleBatchCount: 0x%X" % rectangleBatchCount)
+        print("rectangleBatchOffset: 0x%X" % rectangleBatchOffset)
         print("")
-        print("unk_Value_0x30: %d" % unk_Value_0x30)
-        print("unk_Count_0x30: %d" % unk_Count_0x30) # 0x18
-        print("unk_Offset_0x30: 0x%X" % unk_Offset_0x30)
+        print("rectListCount: 0x%X" % rectListCount)
+        print("rectListOffset: 0x%X" % rectListOffset)
         print("")
         print("unk_Value_0x40: %d" % unk_Value_0x40)
-        print("unk_Count_0x40: %d" % unk_Count_0x40) # 0x8
-        print("unk_Offset_0x40: 0x%X" % unk_Offset_0x40)
+        print("Property Value Count: 0x%X" % propertyValueSetListCount)
+        print("Property Value List Offset: 0x%X" % propertyValueSetListOffset)
         print("")
-        print("unk_Value_0x50: %d" % unk_Value_0x50)
-        print("unk_Count_0x50: %d" % unk_Count_0x50) # 0x90, the realCount = count - 1
+        print("unk_Count_0x50: 0x%X" % unk_Count_0x50)
         print("unk_Offset_0x50: 0x%X" % unk_Offset_0x50)
         print("")
-        print("unk_Value_0x60: %d" % unk_Value_0x60)
-        print("unk_Count_0x60: %d" % unk_Count_0x60) # Strings
-        print("unk_Offset_0x60: 0x%X" % unk_Offset_0x60)
+        print("String List Size: %d" % unk_Count_0x60)
+        print("String List Offset: 0x%X" % unk_Offset_0x60)
         print("")
 
-        objectNameDict = {
-            1: "Player",
-            3: "DirtBlockLarge",
-            4: "DirtBlockSmall",
-            11: "GemRed",
-            12: "GemPink",
-            13: "GemPile",
-            14: "Platter",
-            20: "Chest",
-            25: "CheckpointUnbreakable",
-            29: "PlatformBackForth",
-            37: "Beeto",
-            57: "Slime",
-            46: "FrontGrass",
-            72: "Note",
-            106: "SwordSkeleton",
-            112: "GemPileWall",
-            132: "Skull",
-            137: "GemSmall",
-            147: "GreenDragon",
-            150: "BossBlackKnightPlains",
-            154: "Bubble",
-            161: "BubbleDragon",
-            162: "BreakableWall",
-        }
-
-
-        file.seek(lvb_start + unk_Offset_0x00)
-        for i in range(unk_Count_0x00):
+        ### Property Count Map
+        # Input:    ObjectID
+        # Output:   Property Count
+        self.objectPropertyCountMap = { }
+        file.seek(lvb_start + objectPropertyCountListOffset)
+        for i in range(objectPropertyCountListCount):
             packed = struct.unpack("II", file.read(0x8))
-            # if packed[0] in objectNameDict.keys():
-            #     print("%d %d   %s" % (packed[0], packed[1], objectNameDict[packed[0]]))
-            # else:
-            print("%d %d" % (packed[0], packed[1]))
-        print("")
+            self.objectPropertyCountMap[packed[0]] = packed[1]
 
-        self.objectInfo = namedtuple("ObjectInfo", "unk0 hash x y unk4 unk5 unk6 objectID unk8 unk9 unk10 unk11")
-        self.objectInfoList = [ None ] * unk_Value_0x10
+        ### Object Infos
+        self.objectInfo = namedtuple("ObjectInfo", "unkHash layerNameHash x y scalex scaley isUnk6 objectID unk7 gID propertyCount propertyIndexStart unk11")
+        self.objectInfoList = [ None ] * objectInfoCount
 
-        print("unk_Count_0x10:")
-        file.seek(lvb_start + unk_Offset_0x10)
+        file.seek(lvb_start + objectInfoListOffset)
         for i in range(len(self.objectInfoList)):
-            self.objectInfoList[i] = self.objectInfo._make(struct.unpack("IIffffIIIIII", file.read(0x30)))
+            self.objectInfoList[i] = self.objectInfo._make(struct.unpack("IIffffIHHIIII", file.read(0x30)))
             object = self.objectInfoList[i]
-            print("unk0 0x%X hash 0x%X x %f y %f unk4 %f unk5 %f unk6 0x%X objectID 0x%X unk8 0x%X unk9 0x%X unk10 0x%X unk11 0x%X" % (object.unk0, object.hash, object.x, object.y, object.unk4, object.unk5, object.unk6, object.objectID, object.unk8, object.unk9, object.unk10, object.unk11))
-        print("")
+            # print("pos (%f %f) isUnk6 %X unk7 %X gID %X propertyCount %X propertyIndexStart %X unk11 %X" % (object.x, object.y, object.isUnk6, object.unk7, object.gID, object.propertyCount, object.propertyIndexStart, object.unk11))
 
-        print("unk_Count_0x20:")
-        print("-------------------")
-        file.seek(lvb_start + unk_Offset_0x20)
-        for i in range(unk_Count_0x20):
-            object = struct.unpack("IIIII", file.read(0x14))
-            print("0x%08X 0x%02X %02d %02d %d" % (object[0], object[1], object[2], object[3], object[4]))
-        print("")
+        ### Rectangle Batches
+        self.rectangleBatch = namedtuple("RectangleBatch", "hash flag flag2 count start")
+        self.rectangleBatchList = [ None ] * rectangleBatchCount
+        file.seek(lvb_start + rectangleBatchOffset)
+        for i in range(rectangleBatchCount):
+            self.rectangleBatchList[i] = self.rectangleBatch._make(struct.unpack("IIIII", file.read(0x14)))
 
-        print("unk_Count_0x30:")
-        print("-------------------")
-        file.seek(lvb_start + unk_Offset_0x30)
-        for i in range(unk_Count_0x30):
-            object = struct.unpack("IIIIIi", file.read(0x18))
-            print("0x%08X 0x%04X 0x%03X 0x%03X %d %d" % (object[0], object[1], object[2], object[3], object[4], object[5]))
-        print("")
+        ### Rectangle Infos
+        self.rectangleInfo = namedtuple("RectangleInfo", "x y width height isUnk id")
+        self.rectangleInfoList = [ None ] * rectListCount
+        file.seek(lvb_start + rectListOffset)
+        for i in range(rectListCount):
+            self.rectangleInfoList[i] = self.rectangleInfo._make(struct.unpack("IIIIIi", file.read(0x18)))
 
-        print("unk_Count_0x40:")
-        print("-------------------")
-        file.seek(lvb_start + unk_Offset_0x40)
-        for i in range(unk_Count_0x40):
-            object = struct.unpack("II", file.read(0x8))
-            print("0x%08X 0x%08X" % (object[0], object[1]))
-        print("")
+        ### Unique Property Value Sets
+        self.propertyValueSet = namedtuple("UniquePropertyValueSet", "hash stringOffset")
+        self.propertyValueSetList = [ None ] * propertyValueSetListCount
+        file.seek(lvb_start + propertyValueSetListOffset)
+        for i in range(propertyValueSetListCount):
+            self.propertyValueSetList[i] = self.propertyValueSet._make(struct.unpack("II", file.read(0x8)))
 
-        print("unk_Count_0x50:")
-        print("-------------------")
+        ### Paths
+        print("Paths:")
+        print("------")
+        paths = [0] * unk_Count_0x50
         file.seek(lvb_start + unk_Offset_0x50)
-        for i in range(unk_Count_0x50 - 1):
-            object = struct.unpack("IIIIIIIIIIIII32sIfIIIIIIIIIIIII", file.read(0x90))
-            print("%f %f %f %f" % (object[0], object[1], object[2], object[3]))
-            print("0x%08X 0x%08X 0x%08X 0x%08X" % (object[4], object[5], object[6], object[7]))
-            print("0x%08X 0x%08X 0x%08X 0x%08X" % (object[8], object[9], object[10], object[11]))
-            print("0x%08X %s 0x%08X %f" % (object[12], object[13].decode("utf8").split("\0", 1)[0], object[14], object[15]))
+        for i in range(len(paths)):
+            paths[i] = struct.unpack("Q", file.read(0x8))[0]
+
+        for i in range(len(paths) - 1):
+            file.seek(lvb_start + paths[i])
+            object = struct.unpack("I32sIfffIIIIIIIIIffffffffffffff", file.read(0x90))
+            print("%s" % (object[1].decode("utf8").split("\0", 1)[0]))
+            print("0x%08X %f %f %f" % (object[0x2], object[0x3], object[0x4], object[0x5]))
+            print("0x%08X 0x%08X 0x%08X 0x%08X" % (object[0x6], object[0x7], object[0x8], object[0x9]))
+            print("0x%08X 0x%08X 0x%08X 0x%08X" % (object[0xA], object[0xB], object[0xC], object[0xD]))
+            print("0x%08X" % (object[0xE]))
+            for v in range(4):
+                print("%.2f %.2f %.2f" % (object[0xF + v * 3], object[0x10 + v * 3], object[0x11 + v * 3]))
+            print("%.2f %.2f %.2f" % (object[0x1A], object[0x1B], object[0x1C]))
+        #     # print("0x%08X %s 0x%08X %f" % (object[12], object[13].decode("utf8").split("\0", 1)[0], object[14], object[15]))
+        #     # print("0x%08X 0x%08X 0x%08X 0x%08X" % (object[0x10], object[0x11], object[0x12], object[0x13]))
+        #     # print("0x%08X 0x%08X 0x%08X 0x%08X" % (object[0x14], object[0x15], object[0x16], object[0x17]))
+        #     # print("0x%08X 0x%08X 0x%08X 0x%08X" % (object[0x18], object[0x19], object[0x1A], object[0x1B]))
+        #     # print("0x%08X" % (object[0x1C]))
             print("")
-        print("")
+        # print("")
+
+        ### Value strings
+        self.valueStringListMap = { }
+        file.seek(lvb_start + unk_Offset_0x60)
+        start_pos = file.tell()
+        while file.tell() < start_pos + unk_Count_0x60:
+            pos = file.tell() - start_pos
+            self.valueStringListMap[pos] = ReadString(file)
 
         return
 
@@ -1003,7 +1138,7 @@ def LTBandLVBtoRSDKScene(ltb, lvb, folder):
     # Get max sizes for each layer
     for i in range(len(ltb.layerInfoList)):
         layer = ltb.layerInfoList[i]
-        layerName = layer.name.decode("utf-8").split('\0', 1)[0]
+        layerName = layer.name.decode("utf8").split('\0', 1)[0]
         if "_PLAGUE" in layerName:
             continue
         if layer.endX - layer.startX < -1:
@@ -1029,7 +1164,7 @@ def LTBandLVBtoRSDKScene(ltb, lvb, folder):
     # Write layers to scene
     for i in range(len(ltb.layerInfoList)):
         layer = ltb.layerInfoList[i]
-        layerName = layer.name.decode("utf-8").split('\0', 1)[0]
+        layerName = layer.name.decode("utf8").split('\0', 1)[0]
         if not layerName in outputLayerMap.keys():
             continue
         if layer.endX - layer.startX < -1:
@@ -1088,29 +1223,29 @@ def LTBandLVBtoRSDKScene(ltb, lvb, folder):
 
     # Write objects to scene
     objectNameDict = {
-        1: "Player",
-        3: "DirtBlockLarge",
-        4: "DirtBlockSmall",
-        11: "GemRed",
-        12: "GemPink",
-        13: "GemPile",
-        14: "Platter",
-        20: "Chest",
-        25: "CheckpointUnbreakable",
-        29: "PlatformBackForth",
-        37: "Beeto",
-        57: "Slime",
-        46: "FrontGrass",
-        72: "Note",
-        106: "SwordSkeleton",
-        112: "GemPileWall",
-        132: "Skull",
-        137: "GemSmall",
-        147: "GreenDragon",
-        150: "BossBlackKnightPlains",
-        154: "Bubble",
-        161: "BubbleDragon",
-        162: "BreakableWall",
+        1: "PlayerSK",
+        # 3: "DirtBlockLarge",
+        # 4: "DirtBlockSmall",
+        # 11: "GemRed",
+        # 12: "GemPink",
+        # 13: "GemPile",
+        # 14: "Platter",
+        # 20: "Chest",
+        # 25: "CheckpointUnbreakable",
+        # 29: "PlatformBackForth",
+        # 37: "Beeto",
+        # 57: "Slime",
+        # 46: "FrontGrass",
+        # 72: "Note",
+        # 106: "SwordSkeleton",
+        # 112: "GemPileWall",
+        # 132: "Skull",
+        # 137: "GemSmall",
+        # 147: "GreenDragon",
+        # 150: "BossBlackKnightPlains",
+        # 154: "Bubble",
+        # 161: "BubbleDragon",
+        # 162: "BreakableWall",
     }
     usedObjectClassDict = { }
 
@@ -1165,25 +1300,1071 @@ def LTBandLVBtoRSDKScene(ltb, lvb, folder):
 def LTBandLVBtoTiled(ltb, lvb):
     # Player pos 90.4 -468.99
 
-    # Print Layers
-    for i in range(len(ltb.layerInfoList)):
-        layer = ltb.layerInfoList[i]
-        print("Layer \"%s\"" % layer.name.decode())
-        # print("   Tile Start X: %d" % layer.startX)
-        # print("   Tile Start Y: %d" % layer.startY)
-        # print("   Tile End X: %d" % layer.endX)
-        # print("   Tile End Y: %d" % layer.endY)
-        # print("   Camera Mult X: %f" % layer.cameraMultX)
-        # print("   Camera Mult Y: %f" % layer.cameraMultY)
-        # print("   Layer Offset X: %f" % layer.offsetX)
-        # print("   Layer Offset Y: %f" % layer.offsetY)
-        # print("   VertexBufferInfo Index: %d" % layer.vertexBufferInfoIndex)
-        # print("   Is Using StaticVertexBuffer?: %d" % layer.isUsingStaticVertexBuffer)
-        # print("   Chunk Column Count: %d" % (layer.chunkXCount))
-        # print("   Chunk Row Count: %d" % (layer.chunkYCount))
-        # print("   Chunk Start ID: %d" % (layer.chunkIDStart))
-        print("   Unknowns: %f %f %f %f %f %f %d %d %d %d" % (layer.unk1, layer.unk2, layer.unk3, layer.unk4, layer.unk5, layer.unk6, layer.unkI7, layer.unkI8, layer.unkI9, layer.unkI10))
-        print("")
+    objectNameDict = {
+        1: "Player",
+        3: "DirtBlockLarge",
+        4: "DirtBlockSmall",
+        11: "GemRed",
+        12: "GemPink",
+        13: "GemPile",
+        14: "Platter",
+        20: "Chest",
+        25: "CheckpointUnbreakable",
+        29: "PlatformBackForth",
+        37: "Beeto",
+        57: "Slime",
+        46: "FrontGrass",
+        72: "Note",
+        104: "FishingPit",
+        106: "SwordSkeleton",
+        112: "GemPileWall",
+        132: "Skull",
+        137: "GemSmall",
+        147: "GreenDragon",
+        150: "BossBlackKnightPlains",
+        154: "Bubble",
+        161: "BubbleDragon",
+        162: "BreakableWall",
+        196: "PlagueCoin",
+        215: "PlagueUnknown1"
+    }
+    parameterMap = { }
+    parameterList = [
+        "COLLISION0",
+        "COLLISION1",
+        "COLLISION2",
+        "COLLISION3",
+        "COLLISION4",
+        "COLLISION5",
+        "COLLISION6",
+        "COLLISION7",
+        "COLLISION8",
+        "COLLISION9",
+        "collision_hard_shop",
+        "ladder",
+        "ladder_shovel",
+        "ladder_SHOVEL",
+        "ladder_PLAGUE",
+        "LADDER",
+        "LADDER_SHOVEL",
+        "LADDER_PLAGUE",
+        "collision_hard_attac",
+        "collision_soft",
+        "collision_hard4",
+        "collision_hard3",
+        "collision_hard_SHIP",
+        "collision_hardLoweri",
+        "collision_hardRising",
+        "collision_hard1",
+        "collision_hard_break",
+        "collision_hard_l",
+        "collision_hard_r",
+        "no_bounce2",
+        "collision_hard_2",
+        "no_climb_l",
+        "no_climb_r",
+        "water2",
+        "collision_hard2",
+        "ladder_hidden",
+        "death_pit",
+        "death_pit_shovel",
+        "death_pit_PLAGUE",
+        "collision_hard_hat",
+        "collision_soft_hat",
+        "death_pit_hole",
+        "collision_hard_hole",
+        "collision_hard_door",
+        "collision_soft_hazard",
+        "collision_hard_hazard",
+        "PF_HAZARD",
+        "BGWATERFALL_HAZARD",
+        "PF_SOFT_HAZARD",
+        "collision_hard_hazard",
+        "no_bounce",
+        "ladder_2",
+        "collision_hard_luan",
+        "collision_hard_k",
+        "collision_hard_boss",
+        "death_lava",
+        "collision_hard_windo",
+        "no_climb",
+        "collision_hard_castl",
+        "collision_hard_break_SPECTER",
+        "waterFG",
+        "PF",
+        "ladder",
+        "TORCH",
+        "specterRoom1",
+        "specterRoom2",
+        "specterRoomback",
+        "PF_BG",
+        "deepWater",
+        "deepWaterBack",
+        "fog",
+        "mg1",
+        "mg2",
+        "BG",
+        "PF_ATTACK",
+        "PF_ATTACK_FANCY",
+        "PF_ATTACK_FANCY2",
+        "PF",
+        "PF_fancy",
+        "PF_fancy2",
+        "SOFT PLATFORMS",
+        "SOFT PLATFORMS_FANCY",
+        "SOFT PLATFORMS_FANCY2",
+        "PF_BG0",
+        "PF_BG0_Fancy",
+        "PF_BG0_Fancy2",
+        "PF_BG",
+        "PF_BG_fancy",
+        "PF_BG_fancy2",
+
+        "COLLISION",
+        "BOUNDS",
+        "SCREEN",
+        "SCREEN_BOUND",
+        "SCREEN_BOUNDS",
+
+        # Strings
+        "CONTENTSSPAWNTYPE",
+        "animSequence",
+        "INDEX",
+        "TRIGGER_RANGE_X",
+        "VEL_RISE",
+        "VEL_FALL",
+        "TIME_FALL_WAIT",
+        "COOLDOWN",
+        "SPAWN_TREASURE",
+        "DISTANCE_Y",
+        "DOWN",
+        "SPEED_RIDING",
+        "SPAWNTIME",
+        "TRIGGER_RANGE_Y",
+        "TRIGGER_TIME",
+        "BOMB_SPEED",
+        "TRIGGER_RANGE_OFFSET",
+        "SPEED",
+        "DESTROY",
+        "CHEST",
+        "ROPE",
+        "animResource",
+        "paletteResource",
+        "palette",
+        "animPlayrate",
+        "paletteLayer",
+        "paletteShiftDisable",
+        "LEFT",
+        "RIGHT",
+        "postBattle",
+        "behavior",
+        "VEL_Y",
+        "WAIT_TIME",
+        "WAIT_INTRO",
+        "PIT",
+        "UNDO_SHAKE",
+        "CEILING_CAP_PHYSICS",
+        "CEILING",
+        "NO_WALLS",
+        "EXIT_LEFT",
+        "STAYHIGH",
+        "SAFESCREEN",
+        "CRUSH",
+        "WAIT_MOVINGROOM",
+        "WAIT_BIGBUG",
+        "SAFEABOVE",
+        "SAFESIDE",
+        "Extend",
+        "SHOTDIR",
+        "TIME",
+        "TIME_OFFSET",
+        "VEL_X",
+        "PHYSICS",
+        "LAYER",
+        "NOEXIT",
+        "TOP",
+        "WAIT_FOR_ELEVATOR",
+        "DISTANCE",
+        "PLAYERNUM",
+        "bike",
+        "battle",
+        "rappel",
+        "WAIT_OFFSCREEN",
+        "RANGE_X",
+        "JUMP_Y",
+        "PLAYER_TIMER",
+        "SPEED_MIN",
+        "SPEED_MAX",
+        "JUMP_MIN",
+        "JUMP_MAX",
+        "IGNORE_EDGE",
+        "JUMP",
+        "layer",
+        "TYPE",
+        "NOCONVEYER",
+        "NOEXPLOSION",
+        "HOPMUCH",
+        "PLATFORM",
+        "respawn",
+        "LIT",
+        "riseY",
+        "forceCamera",
+        "warpTo",
+        "PATH",
+        "ANTIC",
+        "VISIBLE",
+        "SHOT_TIME",
+        "HOLD_TIME",
+        "RETURN_TIME",
+        "CORE",
+        "PUSH_RIGHT",
+        "PUSH_LEFT",
+        "PUSH_DOWN",
+        "PUSH_UP",
+        "SHOT_SPEED",
+        "RETURN_SPEED",
+        "SIZE",
+        "PIECE",
+        "WALL",
+        "CONTROLLER_CHECK",
+        "TIME_MOVE",
+        "SHAKE_START",
+        "SHAKE_END",
+        "DEFAULT",
+        "START",
+        "SNAP_START",
+        "type",
+        "region",
+        "HEIGHT",
+        "WIDTH",
+        "TIME_CYCLE",
+        "PATROL_X",
+        "PATROL_TIME",
+        "HALFTILE",
+        "CHAIN_BACK",
+        "VELCAP",
+        "RESPAWN",
+        "BOTTOM",
+        "TRIGGER_MARKER",
+        "BEHAVIOR",
+        "SUCK",
+        "UP",
+        "ANY",
+        "XDIR",
+        "MOVEDURINGWIND",
+        "IDLE",
+        "shot",
+        "COLLISION_Y",
+        "MOVE",
+        "SHOTOFFSET",
+        "FROG",
+        "SHOTTIME",
+        "NOLIMIT",
+        "RANGETILEWIDTH",
+        "INTERVAL",
+        "SHAKE_TIME",
+        "ACCEL_Y",
+        "TIMEON",
+        "ONTIME",
+        "TIMEOFF",
+        "TIMEOFFSET",
+        "VALVE",
+        "S",
+        "SCALE_COLLISION",
+        "BLOCK_COLLIDE",
+        "swingDir",
+        "birder",
+        "SONG",
+        "MEAL",
+        "MERIT",
+        "ROSE",
+        "MONEYDROP",
+        "BIGMONEY",
+        "CARDDROP",
+        "LOOTDROP",
+        "PL_LOOTSWAP",
+        "dialog",
+        "FAKE",
+        "speed",
+        "direction",
+        "CENTER_L",
+        "CENTER_R",
+        "BOAT",
+        "WATER",
+        "TILE_SNAP",
+        "SHAKE_LAYER",
+        "SUDDEN_DEATH",
+        "GOO_FREEZE",
+        "MOVE_NO_WAIT",
+        "stereoDepth",
+        "AIRSHIP",
+        "SPK_LOOTDROP",
+        "FIRE",
+        "FIRE_MIN",
+        "FACING",
+        "FIRE_MAX",
+        "RANGE_Y",
+        "EDGE",
+        "PATROL_Y",
+        "PATROL_OFFSET_X",
+        "PATROL_OFFSET_Y",
+        "PATROL_NEGX",
+        "PATROL_NEGY",
+        "TIME_OFFSET_X",
+        "VEL",
+        "FIRE_PREDICT",
+        "SWOOP_RANGE",
+        "FIRE_TIME",
+        "FIRE_TIME_OFFSET",
+        "FIRE_CYCLE_FIX",
+        "FIRE_HORZ",
+        "FIRE_VEL",
+        "FIRE_PAUSE",
+        "FIRE_CULL_SCREEN",
+        "FIRE_INRANGE",
+        "FIRE_INRANGE_Y",
+        "SCREEN_BOUND",
+        "VALVEXT",
+        "VALVEXT2",
+        "VALVEXT3",
+        "VALVEONTIME",
+        "TILES",
+        "TIMEGROW",
+        "TIMESHRINK",
+        "ONE",
+        "EXTENDED",
+        "TILESEXT",
+        "DISP",
+        "OFFSET",
+        "OIL_LAVA_DEATH",
+        "TIME_ON",
+        "TIME_OFF",
+        "TIME_WARNING",
+        "ID",
+        "LOC",
+        "MAX",
+        "SPAWN_MIN",
+        "SPAWN_MAX",
+        "SPAWN_COOLDOWN",
+        "TIME_MIN",
+        "TIME_MAX",
+        "SPAWN_ALLDEAD",
+        "SPAWN_SAMEALLOWED",
+        "PLAYER_COUNT",
+        "CLOSE_TIME_MIN",
+        "CLOSE_TIME_MAX",
+        "CLOSE_GEM_TIME",
+        "CLOSE_GEM_COUNT",
+        "TWO_PLAYER_ADD_TIME",
+        "ONSCREEN_OFFSET_X",
+        "BATTLE_MODE",
+        "CONTROLLER",
+        "PLAYER_ZONE",
+        "ALT_TIME_MIN",
+        "ALT_TIME_MAX",
+        "CAP",
+        "SPAWNFROM",
+        "TIME_SPEED",
+        "WAITTIME",
+        "NODEWAITTIME",
+        "TIMEOFFSETPERC",
+        "EASE_TYPE",
+        "WAITTIMEADD",
+        "VALVESTOP",
+        "VALVEREVERSE",
+        "SHAKESTART",
+        "SHAKEEND",
+        "DECELTIME",
+        "ACCELTIME",
+        "BACK",
+        "NO_PLAGUE",
+        "SMOKE",
+        "CHUD",
+        "GROUP",
+        "PLK_FISH",
+        "FISH",
+        "out",
+        "ANIM",
+        "SEQUENCE",
+        "rooster",
+        "STENCIL",
+        "TIME_X",
+        "TIME_Y",
+        "COLLISION_LAYER",
+        "offset",
+        "PARTNER",
+        "rotation",
+        "DIR",
+        "WIND_VELCAP",
+        "WIND_POWER",
+        "WIND_DISTANCE",
+        "appearOn",
+        "enter",
+        "enterOnce",
+        "lowhealth",
+        "player",
+        "dialogue",
+        "creditsWindowBreak",
+        "credits",
+        "NO_GHOST",
+        "ICE",
+        "CHEAT_PLAT",
+        "SWING_HEIGHT",
+        "BASH",
+        "GOO",
+        "CHAIN_SEPARATION",
+        "card",
+        "noSpike",
+        "PATROL_NOEASE",
+        "PATROL_TIME_OFFSET",
+        "CHASE_SPEED",
+        "CHASE_WAIT",
+        "CHASE_ONLYWAIT",
+        "THROW_TIME",
+        "THROW_X",
+        "THROW_Y",
+        "THROW_TIME_OFFSET",
+        "THROW_TOP",
+        "THROW_BOTTOM",
+        "THROW_PAUSE",
+        "JUMP_DISTANCE",
+        "REDUCEY",
+        "DISPLAY",
+        "ELEVATOR_BLOCK",
+        "WHITELAYER",
+        "BLACKLAYER",
+        "DISABLE",
+        "BLACKRIGHT",
+        "BLACKLEFT",
+        "NOSTARTSTRIKE",
+        "ALWAYSDARK",
+        "INIT_FORM",
+        "ABORT",
+        "JUMP_HEIGHT",
+        "STD",
+        "CONVEYOR",
+        "WAIT_FOR_PLAYER",
+        "COLLISION",
+        "KING_EXP",
+        "HACK_OFFSET",
+        "SPLINE_RESET",
+        "dialogEvent",
+        "dialogPost",
+        "dialogDefeat",
+        "dialogRun",
+        "railLeft",
+        "railRight",
+        "railOffscreen",
+        "triggerSit",
+        "dialogSit",
+        "layerCheck",
+        "noReward",
+        "dialogInitial",
+        "d",
+        "shop_nofunds",
+        "shop",
+        "shoptrigger",
+        "cardGame",
+        "shopClose",
+        "dialogOrder",
+        "postAnim",
+        "talkAnim",
+        "postPurchaseAnim",
+        "prePurchaseAnim0",
+        "anim1",
+        "anim2",
+        "payOffShortDialog",
+        "npcName",
+        "paletteAlt",
+        "underHUD",
+        "zPos",
+        "zPosBack",
+        "zPosBackCard",
+        "visible",
+        "physics",
+        "keepout",
+        "behaviorHit",
+        "timeoutAnim",
+        "RECT",
+        "ROW",
+        "COLLISION_LEFT",
+        "SPECTER",
+        "KING",
+        "NOFUZZY",
+        "FUZZY_BIGGER",
+        "COLLISION_RIGHT",
+        "DEPTH_OFFSET",
+        "SPECTER_STAGE",
+        "AVOID_PLAYER",
+        "BLAST_AWAY",
+        "FORCE_PAL",
+        "DISABLE_L",
+        "DISABLE_R",
+        "STARTOFF",
+        "animSequenceTrigger",
+        "USE_Y",
+        "triggerSFX",
+        "LIFE",
+        "DISTANCEDOWN",
+        "BALLOON",
+        "WINCH",
+        "NOJINGLE",
+        "NOCOMPLETE",
+        "SECRET",
+        "OFFSCREEN",
+        "dialogNoBuy",
+        "dialogBuy",
+        "dialogOff",
+        "COLOR_R",
+        "COLOR_G",
+        "COLOR_B",
+        "SPAWNIFNONE",
+        "dir",
+        "BORDER",
+        "CANWRAP",
+        "ACTUAL",
+        "noSpawn",
+        "noSpawnDestroy",
+        "NOATTACK",
+        "NOCLIMB",
+        "LAYER2",
+        "LAYER3",
+        "NOPHYSICS",
+        "NOPLAYER",
+        "DIRT",
+        "BARREL",
+        "CANNON",
+        "PBOMB",
+        "feat",
+        "NOENGAGE",
+        "COUNT",
+        "RED",
+        "TURN_TIME",
+        "PATROL_OFFSET",
+        "HEIGHT_SPEED",
+        "DISTANCE_OFFSET",
+        "PATROL_WIDTH",
+        "TURN_PLAYER",
+        "TURN_PLAYER_SPEED",
+        "HEIGHT_CYCLE",
+        "NO_JUMP",
+        "STATUE",
+        "JUMPBACK_Y",
+        "JUMPTHROW",
+        "JUMP_CYCLE",
+        "JUMP_CYCLE_OFFSET",
+        "CHECK_EDGE_WIDTH",
+        "WRAP",
+        "GRAVITY",
+        "killIfCinema",
+        "STREET",
+        "LENGTH",
+        "QUICK",
+        "MAX_SPEED",
+        "TRANSLATION_OFFSET_Y",
+        "TRANSLATION_OFFSET_Z",
+        "SHOT_COUNT",
+        "SHOT_VEL_Y",
+        "SHOT_DROP_TIME",
+        "TARGET",
+        "FLIP",
+        "NOPLAYERBOUNCE",
+        "ANIM_OFFSET_X",
+        "ANIM_OFFSET_Y",
+        "animResource2",
+        "ART_LAYER",
+        "NO_TARGET",
+        "DEACTIVATE_TIME",
+        "TIME_CYCLE_OFFSET",
+        "VEL_ENTER",
+        "VEL_EXIT",
+        "SHOOT",
+        "SHOOT_FLIP",
+        "TIME_ENTER",
+        "TIME_EXIT",
+        "TIME_IDLE",
+        "CANT_EXIT",
+        "SIN_DISTANCE_X",
+        "SIN_SPEED_X",
+        "SIN_DISTANCE_Y",
+        "SIN_SPEED_Y",
+        "VEL_OVERRIDE_X",
+        "MAXVEL",
+        "HITTABLE",
+        "SPEED_FALL",
+        "SPEED_RESET",
+        "OFFOPT",
+        "MAX_TILE",
+        "TIME_RESET",
+        "LIFT",
+        "PAIR",
+        "CANT_BASH_PAST_IDLE",
+        "NO_CRUSH",
+        "DISTANCE_X",
+        "SEARCH_X",
+        "SEARCH_SPEED",
+        "SEARCH_OFFSET_X",
+        "RESPAWN_WAIT_MIN",
+        "RESPAWN_WAIT_MAX",
+        "JUMP_WAIT_MIN",
+        "JUMP_WAIT_MAX",
+        "WAIT_MIN",
+        "WAIT_MAX",
+        "DECREASE",
+        "PERSISTENTCULL",
+        "SHAKEIFON",
+        "nolid",
+        "SPIKE",
+        "SIZE_X",
+        "SIZE_Y",
+        "ON",
+        "VERT",
+        "NOBOUNCE",
+        "FADE",
+        "MARKER",
+        "TIME_TYPE",
+        "CAST_DIR",
+        "ROOM",
+        "DARK",
+        "FRAME",
+        "START_OFFSET",
+        "END_OFFSET",
+        "HOLD",
+        "RETURN_VEL",
+        "TAIL",
+        "RETRACT_TIME",
+        "SPIN",
+        # Bool
+        "SLEEP",
+        "RUN",
+        "LEFT",
+        "RIGHT",
+        "FACING",
+        "stationary",
+        "onExitRange",
+        "UNBREAKABLE",
+        "GRAVE",
+        "noTreasure",
+        "PHASE_IN",
+        "GOO",
+        "PATROL",
+        "wanderAlwaysMove",
+        "wanderAlwaysMoveNT",
+        "ESCAPE",
+        "unlockAttack",
+        "END",
+        "ghost",
+        "QUICK_CAST",
+        "GAMEPLUS",
+        "QUICKCAST",
+        # Integer
+        "index",
+        "Value",
+        "INDEX_GROUP",
+        "bossType",
+        "DIR",
+        "MONEYDROP",
+        "tileRange",
+        "ORDER",
+        "VALUE",
+        "SONG",
+        "TREASUREID",
+        "price",
+        "INDEX",
+        "WATER_STOP",
+        "MAX",
+        "RAND",
+        "TYPE",
+        "MERIT",
+        "credits",
+        "windowBreakIndex",
+        "fancyPayOffIndex",
+        "offset",
+        "ID",
+        "ART_ID",
+        "IDLE_REPS",
+        # Float
+        "spawnExtentX",
+        "spawnExtentY",
+        "OFFSET_X",
+        "OFFSET_Y",
+        "EXPLOSION_TIME",
+        "WAKE_TIME",
+        "WAKE_RANGE_X",
+        "PATROL_X",
+        "PATROL_OFFSET_X",
+        "STOPTIME",
+        "STARTTIME",
+        "WALK_SPEED",
+        "RUN_SPEED",
+        "DIST_SIDE",
+        "DIST_ABOVE",
+        "DIST_SIDE2",
+        "DIST_ABOVE2",
+        "TIME_WAIT_ONE",
+        "TIME_WAIT_TWO",
+        "MOVE_TIME",
+        "MOVE_TIME2",
+        "TIME_OFFSET",
+        "riseY",
+        "SPEED",
+        "swingAngle",
+        "swingSpeed",
+        "length",
+        "zpos",
+        "DROP_X",
+        "RANGE",
+        "LAUNCH_X",
+        "LAUNCH_Y",
+        "SPAWN_TIME",
+        "OFFSETX",
+        "SPAWNTIME",
+        "WAITTIME",
+        "PERC",
+        "SCREEN_PERC",
+        "HEIGHT",
+        "HANG",
+        "HEALTH",
+        "WAIT",
+        "SPAWNOFFSET_Y",
+        "DISTANCE_X",
+        "SPEED_X",
+        "SPEED_Y",
+        "SPAWNOFFSET_X",
+        "tileRange",
+        "tileRangeY",
+        "PRIORITY",
+        "enterXRange",
+        "TIMEON",
+        "TIMEOFF",
+        "TIMEOFFSET",
+        "CHARGE_MAX_X",
+        "CHARGE_MAX_Y",
+        "idleTime",
+        "bounce_vel",
+        "engageX",
+        "RANGE_X",
+        "bounceHeight",
+        "SHOTTIME",
+        "DROP_ENGAGE_X",
+        "RANGE_Y",
+        "WAIT_TIME",
+        "patrolRangeX",
+        "wanderRangeX",
+        "TIME",
+        "START_WAIT",
+        "interactX",
+        "interactOffsetX",
+        "interactY",
+        "zPos",
+        "wanderSpeed",
+        "offset",
+        "walkSpeed",
+        "DELAY_TIME",
+        "openHeight",
+        "ropeWaitTime",
+        "PUSH_SPEED",
+        "distanceRange",
+        "VALUE",
+        "GROUND_TIME",
+        "ROOM_TIME",
+        "TRIGGER_RANGE_X",
+        "TIME_ON",
+        "VANISH_TIME",
+        "SPEED_FALL",
+        "SPEED_RESET",
+        "MAX_TILE",
+        "TIME_RESET",
+        "BASH_MOVE",
+        "ENGAGE_X",
+        "ENGAGE_Y",
+        "SPEED_FLY",
+        "JUMP",
+        "COOLDOWN",
+        "CHARGE_TIME",
+        "CASTING_TIME",
+        "appearTime",
+        # Unk
+                    "TREASUREK",
+        "RIDE",
+        "RED",
+        "SINGLE",
+        "OFFSCREEN",
+        "NO_SCREEN",
+        "NO_COLLIDE",
+        "BOMBER",
+        "STONE",
+        "ONE",
+        "SCRIPTED",
+        "palWorld",
+        "envTime",
+        "useTint",
+        "round",
+        "animSequenceJPN",
+        "anchorLeft",
+        "anchorRight",
+        "credits",
+        "PATH",
+        "IN_ORDER",
+        "REVERSE",
+        "EDGE",
+        "NO_ENGAGE",
+        "SLEEP",
+        "ALT",
+        "STOPTIME",
+        "STARTTIME",
+        "ROOM",
+        "CULL_ONSCREEN",
+        "NO_GOO_CHANGE",
+        "PIT_IMMUNITY",
+        "USE_COLLISION",
+        "LEVEL_TIME",
+        "DIST_SIDE",
+        "DIST_ABOVE",
+        "DIST_SIDE2",
+        "DIST_ABOVE2",
+        "TIME_WAIT_ONE",
+        "TIME_WAIT_TWO",
+        "MOVE_TIME",
+        "MOVE_TIME2",
+        "TIME_OFFSET",
+        "BIRDER",
+        "DIR",
+        "CLIMB",
+        "COOP_ONLY",
+        "CUSTOM",
+        "L",
+        "R",
+        "U",
+        "D",
+        "SECRET",
+        "secret",
+        "FLOAT",
+        "RISE",
+        "BUBBLE",
+        "STILL",
+        "BOSS",
+        "NUDGE_Y",
+        "PERCY",
+        "SCHOLAR",
+        "NOTINWATER",
+        "noHit",
+        "noSpike",
+        "TREASUREID",
+        "dialog",
+        "PL_CHEST_NORMAL",
+        "WILL_BOOST",
+        "DARKNESS_BOOST",
+        "NOCLIMB",
+        "SOFT",
+        "WAIT_PLAYER_CONTROL",
+        "MONEYDROP",
+        "LAUNCH_X",
+        "LAUNCH_Y",
+        "WATERSPURT",
+        "DIGTHROUGH",
+        "DIGTHROUGHFLOOR",
+        "MOLEWATER",
+        "CARROT",
+        "TONIC",
+        "COOP_KILL",
+        "ROOMTIME",
+        "PERSISTENTCULL",
+        "HORNJUMP",
+        "CULL_DEFAULT",
+        "QUICKSPAWN",
+        "SPAWNSFX",
+        "MAX",
+        "STARTSPAWN",
+        "START_AT_SPAWN",
+        "NO_WARNING",
+        "CONTROLLER",
+        "PLAYER_ZONE",
+        "RAND",
+        "SPAWNBYCAMERA",
+        "SPAWNBYROOM",
+        "PERC_SIDE",
+        "SCREEN_PERC",
+        "SINGLE_ONLY",
+        "HEIGHT",
+        "HANG",
+        "PLAGUE",
+        "BEHIND_HUD",
+        "IGNORELIGHTNING",
+        "SPAWNOFFSET_Y",
+        "DISTANCE_X",
+        "SPEED_X",
+        "SPEED_Y",
+        "SCREENWRAP_Y",
+        "AUTORESPAWN",
+        "SPAWNOFFSET_X",
+        "stationary",
+        "DARK",
+        "STEEL",
+        "WATER",
+        "CHEAT_PLAT",
+        "BLOCK",
+        "MOVE",
+        "CHAIN",
+        "BREAKABLE",
+        "COLLECTINPF",
+        "COLLECT_HIDE",
+        "BEHIND_PF",
+        "COLLECT_BEHIND",
+        "BACK",
+        "ELECTRIC",
+        "INFINITE_HEALTH",
+        "SMALL",
+        "coopMultiHit",
+        "CHARGE_MAX_Y",
+        "fall_in",
+        "warpY",
+        "warpAware",
+        "edge",
+        "onebreak",
+        "jumpChase",
+        "jumpDown",
+        "NO_X_MOVEMENT",
+        "NOPHYSICS",
+        "LEGACY_PUSHABLE",
+        "CAMPFIRE",
+        "SLEEPING",
+        "WAIT_TIME",
+        "PIT_FALL",
+        "above",
+        "bottom",
+        "TIME",
+        "WAIT",
+        "START_WAIT",
+        "timeoutRare",
+        "palettePlayerArmor",
+        "timeoutOnIdle",
+        "OLDVILLAGE",
+        "CULLROOM",
+        "UPDATESPAWN",
+        "ROOM_LOCK",
+        "SPEED",
+        "JUMP",
+        "OPPOSITE",
+        "TOP",
+        "FORCE_ENTER",
+        "dialogOff",
+        "FIRE",
+        "RESPAWN",
+        "SPIT",
+        "LOOTDROP",
+        "MERIT",
+        "START_ON",
+        "DONE",
+        "OBEY_Y",
+        "OBEY_NEG_Y",
+        "SPAWNIFNONE",
+        "SPAWNBOSS",
+        "APPLE",
+        "LONG",
+        "WARP",
+        "clouds",
+        "rain",
+        "clearrain",
+        "SO_XB",
+        "LAYER2",
+        "LAYER3",
+        "SEPIA",
+        "underHUD",
+        "runAround",
+        "animSequence",
+        "WITCH",
+        "JUMP_IN",
+        "STAY_DOWN",
+        "POS_X",
+        "POS_Y",
+        "HACK_AUTOHIGH",
+        "NOBLINKSLASH",
+        "old",
+        "tower",
+        "shieldK",
+        "FACING",
+        "START_IDLE",
+        "FOLLOW_FIRE_MARKERS",
+        "floorCheck",
+        "water",
+        "CHALLENGE",
+        "SPIKE_COLLIDE",
+        "GAMEPLUS",
+        "noEdge",
+        "patrol",
+        "NO_PIT",
+        "VP",
+        "TIME_ON",
+        "noclimb",
+        "HORN",
+        "SPARKLEIN",
+        "SPARKLE_WARNING",
+        "NOGRAV",
+        "HUD_HIDE",
+        "UP",
+        "COLLIDE_SLIDE",
+        "ALWAYS_FACE_PLAYER",
+        "TRIGGER_BOTH_SIDES",
+        "IDLE",
+        "BUG_FIGHT",
+        "RANGE",
+        "COOLDOWN",
+        "NO_WALL_SWITCH",
+        "CRAWL_PLAYER",
+        "TYPE",
+        "FORWARD",
+        "TALL",
+        "startOut",
+        "tombShow",
+    ]
+    for i in range(len(parameterList)):
+        stri = parameterList[i]
+        hash = YCG_Hash(stri, len(stri), 123456789)
+        parameterMap[hash] = stri
+
+    # print("Unique Property Value Sets:")
+    # print("---------------------------")
+    # discovered = 0
+    # discoveredMax = 0
+    # for i in range(len(lvb.propertyValueSetList)):
+    #     propertyValue = lvb.propertyValueSetList[i]
+    #     if propertyValue.hash in parameterMap.keys():
+    #         print("Property %d Hash: %s   Value: %s" % (i, parameterMap[propertyValue.hash], lvb.valueStringListMap[propertyValue.stringOffset]))
+    #         discovered += 1
+    #     else:
+    #         print("Property %d Hash: 0x%08X   Value: %s" % (i, propertyValue.hash, lvb.valueStringListMap[propertyValue.stringOffset]))
+    #     discoveredMax += 1
+    # print("Discovered %d / %d" % (discovered, discoveredMax))
+    # print("")
+
+    map_name = "Plains"
+
+    layer_id = 1
+    object_id = 1
+
+    xml_map = Element("map")
+    xml_map.set("version", "1.2")
+    xml_map.set("tiledversion", "1.3.3")
+    xml_map.set("orientation", "orthogonal")
+    xml_map.set("renderorder", "right-down")
+    xml_map.set("width", "25")
+    xml_map.set("height", "25")
+    xml_map.set("tilewidth", "16")
+    xml_map.set("tileheight", "16")
+    xml_map.set("infinite", "0")
+    # xml_map.set("nextlayerid", "3")
+    # xml_map.set("nextobjectid", "2")
+
+    comment = Comment("Generated using ShovelKnightRE: https://github.com/aknetk/ShovelKnightRE")
+    xml_map.append(comment)
+
+    xml_tileset = SubElement(xml_map, "tileset")
+    xml_tileset.set("firstgid", "1")
+    xml_tileset.set("source", "Plains.tsx")
+    xml_tileset = SubElement(xml_map, "tileset")
+    xml_tileset.set("firstgid", "785")
+    xml_tileset.set("source", "PlainsWaterfall.tsx")
 
     tilebuffer = [[0] * 64 for i in range(64)]
 
@@ -1214,32 +2395,6 @@ def LTBandLVBtoTiled(ltb, lvb):
         cell_y = math.floor(v / 18.0)
         tilebuffer[tile_x][tile_y] = math.floor(cell_x + cell_y * columncount) + 1
 
-    # Tilebuffer to Tiled CSV array
-    map_format = "<?xml version=\"1.0\" encoding=\"UTF-8\"?> \n\
-    <map version=\"1.2\" tiledversion=\"1.3.3\" orientation=\"orthogonal\" renderorder=\"right-down\" width=\"25\" height=\"14\" tilewidth=\"16\" tileheight=\"16\" infinite=\"0\" nextlayerid=\"3\" nextobjectid=\"2\"> \n\
-        <tileset firstgid=\"1\" source=\"Plains.tsx\"/> \n\
-        <tileset firstgid=\"785\" source=\"PlainsWaterfall.tsx\"/> \n\
-%s \n\
-        <objectgroup id=\"2\" name=\"Object Layer\"> \n\
-%s \n\
-        </objectgroup> \n\
-    </map>"
-    layer_format = "            <layer id=\"1\" name=\"%s\" width=\"%d\" height=\"%d\" offsetx=\"%f\" offsety=\"%f\" visible=\"%d\"> \n\
-        <data encoding=\"csv\"> \n\
-%s \n\
-        </data> \n\
-        <properties> \n\
-            <property name=\"camScrollX\" type=\"float\" value=\"%f\" /> \n\
-            <property name=\"camScrollY\" type=\"float\" value=\"%f\" /> \n\
-        </properties> \n\
-    </layer> \n"
-    chunk_format = "                    <chunk x=\"%d\" y=\"%d\" width=\"%d\" height=\"%d\"> \n\
-%s \n\
-            </chunk> \n"
-    object_format = "            <object x=\"%f\" y=\"%f\" name=\"%s\"> \n\
-                <point/> \n\
-            </object> \n"
-
     normal_tile_count = 401
     first_sheet_tile_count = 784
 
@@ -1247,13 +2402,33 @@ def LTBandLVBtoTiled(ltb, lvb):
     for i in range(len(ltb.layerInfoList)):
         layer = ltb.layerInfoList[i]
         visible = 1
-        if "_PLAGUE" in layer.name.decode():
-            visible = 0
-            continue
         if layer.endX - layer.startX < -1:
             continue
         if layer.endY - layer.startY < -1:
             continue
+
+        xml_layer = SubElement(xml_map, "layer")
+        xml_layer.set("id", str(layer_id))
+        xml_layer.set("name", layer.name.decode("utf8").split('\0', 1)[0])
+        xml_layer.set("width", str(layer.endX - layer.startX + 1))
+        xml_layer.set("height", str(layer.endY - layer.startY + 1))
+        xml_layer.set("offsetx", str(layer.startX * 16))
+        xml_layer.set("offsety", str(layer.startY * 16))
+        xml_layer.set("visible", str(visible))
+        layer_id += 1
+
+        xml_data = SubElement(xml_layer, "data")
+        xml_data.set("encoding", "csv")
+
+        xml_properties = SubElement(xml_layer, "properties")
+        xml_property = SubElement(xml_properties, "property")
+        xml_property.set("name", "SCROLL_X_MULT")
+        xml_property.set("type", "float")
+        xml_property.set("value", "%f" % layer.cameraMultX)
+        xml_property = SubElement(xml_properties, "property")
+        xml_property.set("name", "SCROLL_Y_MULT")
+        xml_property.set("type", "float")
+        xml_property.set("value", "%f" % layer.cameraMultY)
 
         if layer.isUsingStaticVertexBuffer != 0:
             csv = ""
@@ -1265,7 +2440,9 @@ def LTBandLVBtoTiled(ltb, lvb):
                         first = False
                     else:
                         csv += ",%d" % (int(tilebuffer[tx][layer.endY - ty]))
-            layerList_string += layer_format % (layer.name.decode("utf-8").split('\0', 1)[0], layer.endX - layer.startX + 1, layer.endY - layer.startY + 1, 0, 0, visible, csv, layer.cameraMultX, layer.cameraMultY)
+            xml_layer.set("offsetx", "0.0")
+            xml_layer.set("offsety", "0.0")
+            xml_data.text = csv
         else:
             chunk_text = ""
             chunkStart = layer.chunkIDStart
@@ -1298,45 +2475,85 @@ def LTBandLVBtoTiled(ltb, lvb):
                                     first = False
                                 else:
                                     csv += ",%d" % (int(tiled_out))
-                        chunk_text += chunk_format % (cx * 16, cy * 16, 16, 16, csv)
-            layerList_string += layer_format % (layer.name.decode("utf-8").split('\0', 1)[0], layer.endX - layer.startX + 1, layer.endY - layer.startY + 1, layer.startX * 16, layer.startY * 16, visible, chunk_text, layer.cameraMultX, layer.cameraMultY)
 
-    objectNameDict = {
-        1: "Player",
-        3: "DirtBlockLarge",
-        4: "DirtBlockSmall",
-        11: "GemRed",
-        12: "GemPink",
-        13: "GemPile",
-        14: "Platter",
-        20: "Chest",
-        25: "Unbreakable Checkpoint",
-        29: "Back Forth Platform",
-        37: "Beeto",
-        57: "Slime",
-        46: "FrontGrass",
-        72: "Note",
-        106: "SwordSkeleton",
-        112: "GemPileWall",
-        132: "Skull",
-        137: "GemSmall",
-        147: "GreenDragon",
-        150: "BossBlackKnightPlains",
-        154: "Bubble",
-        161: "BubbleDragon",
-        162: "BreakableWall",
-    }
+                        xml_chunk = SubElement(xml_data, "chunk")
+                        xml_chunk.set("x", str(cx * 16))
+                        xml_chunk.set("y", str(cy * 16))
+                        xml_chunk.set("width", "16")
+                        xml_chunk.set("height", "16")
+                        xml_chunk.text = csv
 
-    objectList_string = ""
+    for b in range(len(lvb.rectangleBatchList)):
+        batch = lvb.rectangleBatchList[b]
+        xml_objectgroup = SubElement(xml_map, "objectgroup")
+        xml_objectgroup.set("id", str(layer_id))
+        xml_objectgroup.set("visible", "false")
+        if batch.hash in parameterMap.keys():
+            print(parameterMap[batch.hash])
+            xml_objectgroup.set("name", parameterMap[batch.hash])
+        else:
+            xml_objectgroup.set("name", "Rect Layer %08X" % batch.hash)
+        layer_id += 1
+        for r in range(batch.start, batch.start + batch.count):
+            recta = lvb.rectangleInfoList[r]
+            xml_object = SubElement(xml_objectgroup, "object")
+            xml_object.set("x", str(recta.x))
+            xml_object.set("y", str(recta.y))
+            xml_object.set("width", str(recta.width))
+            xml_object.set("height", str(recta.height))
+            xml_object.set("id", str(recta.id))
+            object_id = recta.id + 1
+
+    # parameterMap
+    xml_objectgroup = SubElement(xml_map, "objectgroup")
+    xml_objectgroup.set("id", str(layer_id))
+    xml_objectgroup.set("name", "Object Layer %08X" % 0xDEADBEEF)
+    layer_id += 1
+
+    unk7s = {}
+    # self.objectInfo = namedtuple("ObjectInfo", "unkHash layerNameHash x y scalex scaley unk6 objectID unk7 gID propertyCount propertyIndexStart unk11")
+
     for i in range(len(lvb.objectInfoList)):
         object = lvb.objectInfoList[i]
         oID = object.objectID & 0xFFF
-        if oID in objectNameDict.keys():
-            objectList_string += object_format % (object.x, object.y, objectNameDict[oID])
-        else:
-            objectList_string += object_format % (object.x, object.y, str(oID))
 
-    open("../Scenes/Plains.tmx", "w").write(map_format % (layerList_string, objectList_string))
+        xml_object = SubElement(xml_objectgroup, "object")
+        xml_object.set("x", str(object.x))
+        xml_object.set("y", str(object.y))
+        if oID in objectNameDict.keys():
+            xml_object.set("name", objectNameDict[oID])
+        else:
+            xml_object.set("name", "UnknownObject %d" % oID)
+        xml_object.set("id", str(object.gID & 0xFFFF))
+        xml_point = SubElement(xml_object, "point")
+        object_id += 1
+
+        unk7s[object.unk7] = object.unk7
+
+        xml_properties = SubElement(xml_object, "properties")
+
+        p_count = lvb.objectPropertyCountMap[oID]
+        p_start = object.propertyIndexStart
+        p_end = p_start + object.propertyCount
+        for p in range(p_start, p_end):
+            valueSet = lvb.propertyValueSetList[p]
+            property_name = "0x%08X" % valueSet.hash
+            property_value = ""
+            if valueSet.hash in parameterMap.keys():
+                property_name = parameterMap[valueSet.hash]
+            if valueSet.stringOffset in lvb.valueStringListMap.keys():
+                property_value = lvb.valueStringListMap[valueSet.stringOffset]
+
+            xml_property = SubElement(xml_properties, "property")
+            xml_property.set("name", property_name)
+            xml_property.set("type", "string")
+            xml_property.set("value", property_value)
+
+    print("unk7s")
+    for u in unk7s.keys():
+        print("u: %d" % u)
+
+    open("../Scenes/" + map_name + ".tmx", "w").write(prettifyXML(xml_map))
 
     paletteInfo = ltb.textureFormatInfoList[0]
     ltb.file.seek(ltb.ltb_start + ltb.attachedFileList[0])
@@ -1387,7 +2604,7 @@ if __name__ == '__main__':
     # os.chdir(Path(sys.argv[1]).parent)
     ltb = LTBClass(Path(sys.argv[1]))
     lvb = LVBClass(Path(sys.argv[2]))
-    # LTBandLVBtoTiled(ltb, lvb)
+    LTBandLVBtoTiled(ltb, lvb)
     # LTBandLVBtoRSDKScene(ltb, lvb, "Plains")
 
 _exit("Log: Program finished.")
